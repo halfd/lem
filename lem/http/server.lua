@@ -1,6 +1,7 @@
 --
 -- This file is part of LEM, a Lua Event Machine.
 -- Copyright 2011-2013 Emil Renner Berthing
+-- Copyright 2013      Halfdan Mouritzen
 --
 -- LEM is free software: you can redistribute it and/or modify it
 -- under the terms of the GNU Lesser General Public License as
