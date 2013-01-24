@@ -1,6 +1,6 @@
 /*
  * This file is part of LEM, a Lua Event Machine.
- * Copyright 2011-2012 Emil Renner Berthing
+ * Copyright 2011-2013 Emil Renner Berthing
  *
  * LEM is free software: you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as
@@ -127,8 +127,8 @@ static const unsigned char state_table[SMAX][C_MAX] = {
 /* SH__*/ { X___,X___,X___,X___,X___,X___,X___,X___,X___,X___,SHT1,X___,X___ },
 /* SHT1*/ { X___,X___,X___,X___,X___,X___,X___,X___,X___,X___,SHT2,X___,X___ },
 /* SHT2*/ { X___,X___,X___,X___,X___,X___,X___,X___,X___,X___,X___,SHTP,X___ },
-/* SHTP*/ { X___,X___,X___,X___,X___,SSLH,X___,X___,X___,X___,X___,X___,X___ },
-/* SSLH*/ { X___,X___,X___,X___,X___,X___,X___,X___,SMAV,X___,X___,X___,X___ },
+/* SHTP*/ { X___,X___,X___,SHTP,X___,SSLH,X___,X___,X___,X___,X___,X___,X___ },
+/* SSLH*/ { X___,X___,X___,SSLH,X___,X___,X___,X___,SMAV,X___,X___,X___,X___ },
 /* SMAV*/ { X___,X___,X___,X___,X___,X___,X___,SDOT,SMAV,X___,X___,X___,X___ },
 /* SDOT*/ { X___,X___,X___,X___,X___,X___,X___,X___,SMIV,X___,X___,X___,X___ },
 /* SMIV*/ { X___,X___,SRE1,X___,X___,X___,X___,X___,SMIV,X___,X___,X___,X___ },
@@ -136,8 +136,8 @@ static const unsigned char state_table[SMAX][C_MAX] = {
 /* CH__*/ { X___,X___,X___,X___,X___,X___,X___,X___,X___,X___,CHT1,X___,X___ },
 /* CHT1*/ { X___,X___,X___,X___,X___,X___,X___,X___,X___,X___,CHT2,X___,X___ },
 /* CHT2*/ { X___,X___,X___,X___,X___,X___,X___,X___,X___,X___,X___,CHTP,X___ },
-/* CHTP*/ { X___,X___,X___,X___,X___,CSLH,X___,X___,X___,X___,X___,X___,X___ },
-/* CSLH*/ { X___,X___,X___,X___,X___,X___,X___,X___,CMAV,X___,X___,X___,X___ },
+/* CHTP*/ { X___,X___,X___,CHTP,X___,CSLH,X___,X___,X___,X___,X___,X___,X___ },
+/* CSLH*/ { X___,X___,X___,CSLH,X___,X___,X___,X___,CMAV,X___,X___,X___,X___ },
 /* CMAV*/ { X___,X___,X___,X___,X___,X___,X___,CDOT,CMAV,X___,X___,X___,X___ },
 /* CDOT*/ { X___,X___,X___,X___,X___,X___,X___,X___,CMIV,X___,X___,X___,X___ },
 /* CMIV*/ { X___,X___,X___,XVNS,X___,X___,X___,X___,CMIV,X___,X___,X___,X___ },
@@ -206,8 +206,20 @@ parse_http_process(lua_State *T, struct lem_inputbuf *b)
 		case CMIV:
 		case CNUM:
 		case CTXT:
-		case SKEY:
 		case SVAL:
+			b->buf[w++] = ch;
+			break;
+
+		case XKEY:
+			state = SKEY;
+			lua_pushlstring(T, b->buf, w);
+			lua_rawset(T, -3);
+			w = 0;
+			/* fallthrough */
+
+		case SKEY:
+			if (ch >= 'A' && ch <= 'Z')
+				ch += ('a' - 'A');
 			b->buf[w++] = ch;
 			break;
 
@@ -280,14 +292,6 @@ parse_http_process(lua_State *T, struct lem_inputbuf *b)
 		case XVAL:
 			state = SVAL;
 			b->buf[w++] = ' ';
-			b->buf[w++] = ch;
-			break;
-
-		case XKEY:
-			state = SKEY;
-			lua_pushlstring(T, b->buf, w);
-			lua_rawset(T, -3);
-			w = 0;
 			b->buf[w++] = ch;
 			break;
 
