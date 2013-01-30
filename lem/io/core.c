@@ -16,6 +16,7 @@
  * License along with LEM.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#define _GNU_SOURCE
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
@@ -32,6 +33,7 @@
 
 #if defined(__FreeBSD__) || defined(__APPLE__)
 #include <sys/un.h>
+#include <sys/ucred.h>
 #include <netinet/in.h>
 #ifndef UNIX_PATH_MAX
 #define UNIX_PATH_MAX 104
@@ -119,15 +121,21 @@ io_open_work(struct lem_async *a)
 	int fd;
 	struct stat st;
 
-	fd = open(o->path, o->flags | O_NONBLOCK,
-			o->fd >= 0 ? o->fd :
+	fd = open(o->path, o->flags
+#ifdef O_CLOEXEC
+			| O_CLOEXEC
+#endif
+			| O_NONBLOCK, o->fd >= 0 ? o->fd :
 			S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
 	if (fd < 0) {
 		o->flags = -errno;
 		return;
 	}
-
-	if (fstat(fd, &st)) {
+	if (
+#ifndef O_CLOXEC
+			fcntl(fd, F_SETFD, FD_CLOEXEC) == -1 ||
+#endif
+			fstat(fd, &st)) {
 		o->flags = -errno;
 		close(fd);
 		return;
@@ -247,12 +255,11 @@ push_stdstream(lua_State *L, int fd)
 	struct stream *s;
 
 	/* make the socket non-blocking */
-	if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0)
-		luaL_error(L, "error making fd %d non-blocking: %s",
-				fd, strerror(errno));
+	fcntl(fd, F_SETFL, O_NONBLOCK);
 
 	s = stream_new(L, fd, -2);
-	s->open = 2; /* don't close this in __gc() */
+	/* don't close this in __gc(), but make it blocking again */
+	s->open = 2;
 }
 
 int
@@ -313,12 +320,17 @@ luaopen_lem_io_core(lua_State *L)
 	/* mt.write = <stream_write> */
 	lua_pushcfunction(L, stream_write);
 	lua_setfield(L, -2, "write");
+#ifdef TCP_CORK
 	/* mt.cork = <stream_cork> */
 	lua_pushcfunction(L, stream_cork);
 	lua_setfield(L, -2, "cork");
 	/* mt.uncork = <stream_uncork> */
 	lua_pushcfunction(L, stream_uncork);
 	lua_setfield(L, -2, "uncork");
+#endif
+	/* mt.getpeer = <stream_getpeer> */
+	lua_pushcfunction(L, stream_getpeer);
+	lua_setfield(L, -2, "getpeer");
 	/* mt.sendfile = <stream_sendfile> */
 	lua_pushcfunction(L, stream_sendfile);
 	lua_setfield(L, -2, "sendfile");
@@ -402,7 +414,7 @@ luaopen_lem_io_core(lua_State *L)
 	lua_getfield(L, -2, "Server"); /* upvalue 1 = Server */
 	lua_pushcclosure(L, unix_listen, 1);
 	lua_setfield(L, -2, "listen");
-	/* insert the tcp table */
+	/* insert the unix table */
 	lua_setfield(L, -2, "unix");
 
 	return 1;

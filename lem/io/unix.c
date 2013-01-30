@@ -31,13 +31,23 @@ unix_connect_work(struct lem_async *a)
 	struct sockaddr_un addr;
 	int sock;
 
-	sock = socket(AF_UNIX, SOCK_STREAM, 0);
+	sock = socket(AF_UNIX,
+#ifdef SOCK_CLOEXEC
+			SOCK_CLOEXEC |
+#endif
+			SOCK_STREAM, 0);
 	if (sock < 0) {
 		u->sock = -1;
 		u->err = errno;
 		return;
 	}
-
+#ifndef SOCK_CLOEXEC
+	if (fcntl(sock, F_SETFD, FD_CLOEXEC) == -1) {
+		u->sock = -1;
+		u->err = errno;
+		goto error;
+	}
+#endif
 	addr.sun_family = AF_UNIX;
 	memcpy(addr.sun_path, u->path, u->len+1);
 
@@ -49,8 +59,8 @@ unix_connect_work(struct lem_async *a)
 	}
 
 	/* make the socket non-blocking */
-	if (fcntl(sock, F_SETFL, O_NONBLOCK)) {
-		u->sock = -3;
+	if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
+		u->sock = -1;
 		u->err = errno;
 		goto error;
 	}
@@ -87,10 +97,6 @@ unix_connect_reap(struct lem_async *a)
 		lua_pushfstring(T, "error connecting to '%s': %s",
 				u->path, strerror(u->err));
 		break;
-	case 3:
-		lua_pushfstring(T, "error making socket non-blocking: %s",
-		                strerror(u->err));
-		break;
 	}
 	lem_queue(T, 2);
 	free(u);
@@ -123,13 +129,24 @@ unix_listen_work(struct lem_async *a)
 	struct sockaddr_un addr;
 	int sock;
 
-	sock = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (sock < 0) {
+	sock = socket(AF_UNIX,
+#ifdef SOCK_CLOEXEC
+			SOCK_CLOEXEC |
+#endif
+			SOCK_STREAM, 0);
+	if (sock < 0
+			) {
 		u->sock = -1;
 		u->err = errno;
 		return;
 	}
-
+#ifndef SOCK_CLOEXEC
+	if (fcntl(sock, F_SETFD, FD_CLOEXEC) == -1) {
+		u->sock = -1;
+		u->err = errno;
+		goto error;
+	}
+#endif
 	addr.sun_family = AF_UNIX;
 	memcpy(addr.sun_path, u->path, u->len+1);
 
@@ -153,8 +170,8 @@ unix_listen_work(struct lem_async *a)
 	}
 
 	/* make the socket non-blocking */
-	if (fcntl(sock, F_SETFL, O_NONBLOCK)) {
-		u->sock = -5;
+	if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
+		u->sock = -1;
 		u->err = errno;
 		goto error;
 	}
@@ -208,11 +225,6 @@ unix_listen_reap(struct lem_async *a)
 	case 4:
 		lua_pushfstring(T, "error listening on '%s': %s",
 				u->path, strerror(u->err));
-		break;
-
-	case 5:
-		lua_pushfstring(T, "error making socket non-blocking: %s",
-		                strerror(u->err));
 		break;
 	}
 	lem_queue(T, 2);

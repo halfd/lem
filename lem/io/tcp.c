@@ -16,14 +16,16 @@
  * License along with LEM.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#ifndef MAXPENDING
+#define MAXPENDING      50
+#endif
+
 struct tcp_getaddr {
 	struct lem_async a;
 	const char *node;
 	const char *service;
-	struct addrinfo *result;
 	int sock;
 	int err;
-	uint16_t port;
 };
 
 static const int tcp_famnumber[] = { AF_UNSPEC, AF_INET, AF_INET6 };
@@ -34,7 +36,7 @@ tcp_connect_work(struct lem_async *a)
 {
 	struct tcp_getaddr *g = (struct tcp_getaddr *)a;
 	struct addrinfo hints = {
-		.ai_flags     = AI_CANONNAME,
+		.ai_flags     = 0,
 		.ai_family    = tcp_famnumber[g->sock],
 		.ai_socktype  = SOCK_STREAM,
 		.ai_protocol  = IPPROTO_TCP,
@@ -43,11 +45,12 @@ tcp_connect_work(struct lem_async *a)
 		.ai_canonname = NULL,
 		.ai_next      = NULL
 	};
+	struct addrinfo *result;
 	struct addrinfo *addr;
 	int sock;
 
 	/* lookup name */
-	sock = getaddrinfo(g->node, g->service, &hints, &g->result);
+	sock = getaddrinfo(g->node, g->service, &hints, &result);
 	if (sock) {
 		g->sock = -1;
 		g->err = sock;
@@ -55,10 +58,11 @@ tcp_connect_work(struct lem_async *a)
 	}
 
 	/* try the addresses in the order returned */
-	for (addr = g->result; addr; addr = addr->ai_next) {
-		uint16_t port;
-
+	for (addr = result; addr; addr = addr->ai_next) {
 		sock = socket(addr->ai_family,
+#ifdef SOCK_CLOEXEC
+				SOCK_CLOEXEC |
+#endif
 				addr->ai_socktype, addr->ai_protocol);
 
 		lem_debug("addr->ai_family = %d, sock = %d", addr->ai_family, sock);
@@ -70,37 +74,39 @@ tcp_connect_work(struct lem_async *a)
 
 			g->sock = -2;
 			g->err = err;
+			goto out;
+		}
+#ifndef SOCK_CLOEXEC
+		if (fcntl(sock, F_SETFD, FD_CLOEXEC) == -1) {
+			g->sock = -2;
+			g->err = errno;
 			goto error;
 		}
-
+#endif
 		/* connect */
 		if (connect(sock, addr->ai_addr, addr->ai_addrlen)) {
-			(void)close(sock);
+			close(sock);
 			continue;
 		}
 
 		/* make the socket non-blocking */
-		if (fcntl(sock, F_SETFL, O_NONBLOCK)) {
-			g->sock = -3;
+		if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
+			g->sock = -2;
 			g->err = errno;
 			goto error;
 		}
 
 		g->sock = sock;
-		if (addr->ai_family == AF_INET6)
-			port = ((struct sockaddr_in6 *)addr->ai_addr)->sin6_port;
-		else
-			port = ((struct sockaddr_in *)addr->ai_addr)->sin_port;
-		g->port = ntohs(port);
-		return;
+		goto out;
 	}
 
-	g->sock = -4;
+	g->sock = -3;
+	goto out;
 
 error:
-	freeaddrinfo(g->result);
-	if (sock >= 0)
-		close(sock);
+	close(sock);
+out:
+	freeaddrinfo(result);
 }
 
 static void
@@ -112,20 +118,10 @@ tcp_connect_reap(struct lem_async *a)
 
 	lem_debug("connection established");
 	if (sock >= 0) {
-		struct addrinfo *result = g->result;
-		const char *name = result->ai_canonname;
-		uint16_t port = g->port;
-
-		if (name == NULL)
-			name = g->node;
-
 		free(g);
 
 		stream_new(T, sock, 3);
-		lua_pushstring(T, name);
-		lua_pushnumber(T, port);
-		freeaddrinfo(result);
-		lem_queue(T, 3);
+		lem_queue(T, 1);
 		return;
 	}
 
@@ -140,16 +136,12 @@ tcp_connect_reap(struct lem_async *a)
 				strerror(g->err));
 		break;
 	case 3:
-		lua_pushfstring(T, "error making socket non-blocking: %s",
-		                strerror(g->err));
-		break;
-	case 4:
 		lua_pushfstring(T, "error connecting to '%s:%s'",
 				g->node, g->service);
 		break;
 	}
-	lem_queue(T, 2);
 	free(g);
+	lem_queue(T, 2);
 }
 
 static int
@@ -188,10 +180,6 @@ tcp_listen_work(struct lem_async *a)
 	struct addrinfo *addr = NULL;
 	int sock = -1;
 	int ret;
-	uint16_t port;
-
-	if (g->node != NULL)
-		hints.ai_flags |= AI_CANONNAME;
 
 	/* lookup name */
 	ret = getaddrinfo(g->node, g->service, &hints, &addr);
@@ -202,14 +190,24 @@ tcp_listen_work(struct lem_async *a)
 	}
 
 	/* create the TCP socket */
-	sock = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+	sock = socket(addr->ai_family,
+#ifdef SOCK_CLOEXEC
+			SOCK_CLOEXEC |
+#endif
+			addr->ai_socktype, addr->ai_protocol);
 	lem_debug("addr->ai_family = %d, sock = %d", addr->ai_family, sock);
 	if (sock < 0) {
 		g->sock = -2;
 		g->err = errno;
+		goto out;
+	}
+#ifndef SOCK_CLOEXEC
+	if (fcntl(sock, F_SETFD, FD_CLOEXEC) == -1) {
+		g->sock = -2;
+		g->err = errno;
 		goto error;
 	}
-
+#endif
 	/* set SO_REUSEADDR option if possible */
 	ret = 1;
 	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &ret, sizeof(int));
@@ -233,25 +231,19 @@ tcp_listen_work(struct lem_async *a)
 	}
 
 	/* make the socket non-blocking */
-	if (fcntl(sock, F_SETFL, O_NONBLOCK)) {
-		g->sock = -5;
+	if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
+		g->sock = -2;
 		g->err = errno;
 		goto error;
 	}
 
 	g->sock = sock;
-	g->result = addr;
-	if (addr->ai_family == AF_INET6)
-		port = ((struct sockaddr_in6 *)addr->ai_addr)->sin6_port;
-	else
-		port = ((struct sockaddr_in *)addr->ai_addr)->sin_port;
-	g->port = ntohs(port);
-	return;
+	goto out;
 
 error:
+	close(sock);
+out:
 	freeaddrinfo(addr);
-	if (sock >= 0)
-		close(sock);
 }
 
 static void
@@ -265,13 +257,7 @@ tcp_listen_reap(struct lem_async *a)
 		g->node = "*";
 
 	if (sock >= 0) {
-		struct addrinfo *result = g->result;
-		const char *name = result->ai_canonname;
-		uint16_t port = g->port;
 		struct ev_io *w;
-
-		if (name == NULL)
-			name = g->node;
 
 		free(g);
 
@@ -284,10 +270,7 @@ tcp_listen_reap(struct lem_async *a)
 		ev_io_init(w, NULL, sock, EV_READ);
 		w->data = NULL;
 
-		lua_pushstring(T, name);
-		lua_pushnumber(T, port);
-		freeaddrinfo(result);
-		lem_queue(T, 3);
+		lem_queue(T, 1);
 		return;
 	}
 
@@ -309,14 +292,9 @@ tcp_listen_reap(struct lem_async *a)
 		lua_pushfstring(T, "error listening on '%s:%s': %s",
 				g->node, g->service, strerror(g->err));
 		break;
-
-	case 5:
-		lua_pushfstring(T, "error making socket non-blocking: %s",
-		                strerror(g->err));
-		break;
 	}
-	lem_queue(T, 2);
 	free(g);
+	lem_queue(T, 2);
 }
 
 static int

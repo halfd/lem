@@ -16,10 +16,6 @@
  * License along with LEM.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef MAXPENDING
-#define MAXPENDING      50
-#endif
-
 static int
 server_closed(lua_State *T)
 {
@@ -98,35 +94,42 @@ server_interrupt(lua_State *T)
 }
 
 static int
-server__accept(lua_State *T, struct ev_io *w)
+server__accept(lua_State *T, struct ev_io *w, int mt)
 {
-	struct sockaddr client_addr;
-	unsigned int client_addrlen;
-	int sock;
+#ifdef SOCK_CLOEXEC
+	int sock = accept4(w->fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+#else
+	int sock = accept(w->fd, NULL, NULL);
+#endif
 
-	sock = accept(w->fd, &client_addr, &client_addrlen);
 	if (sock < 0) {
-		if (errno == EAGAIN || errno == ECONNABORTED)
+		switch (errno) {
+		case EAGAIN: case EINTR: case ECONNABORTED:
+		case ENETDOWN: case EPROTO: case ENOPROTOOPT:
+		case EHOSTDOWN:
+#ifdef ENONET
+		case ENONET:
+#endif
+		case EHOSTUNREACH: case EOPNOTSUPP: case ENETUNREACH:
 			return 0;
-
-		close(w->fd);
-		w->fd = -1;
+		}
 		lua_pushnil(T);
 		lua_pushfstring(T, "error accepting connection: %s",
 		                strerror(errno));
 		return 2;
 	}
-
-	/* make the socket non-blocking */
-	if (fcntl(sock, F_SETFL, O_NONBLOCK) < 0) {
+#ifndef SOCK_CLOEXEC
+	/* set FD_CLOEXEC and make the socket non-blocking */
+	if (fcntl(sock, F_SETFD, FD_CLOEXEC) == -1 ||
+			fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
 		close(sock);
 		lua_pushnil(T);
-		lua_pushfstring(T, "error making socket non-blocking: %s",
+		lua_pushfstring(T, "error setting socket flags: %s",
 		                strerror(errno));
 		return 2;
 	}
-
-	stream_new(T, sock, lua_upvalueindex(1));
+#endif
+	stream_new(T, sock, mt);
 	return 1;
 }
 
@@ -137,12 +140,16 @@ server_accept_cb(EV_P_ struct ev_io *w, int revents)
 
 	(void)revents;
 
-	ret = server__accept(w->data, w);
+	ret = server__accept(w->data, w, 2);
 	if (ret == 0)
 		return;
 
 	w->data = NULL;
 	ev_io_stop(EV_A_ w);
+	if (ret == 2) {
+		close(w->fd);
+		w->fd = -1;
+	}
 	lem_queue(w->data, ret);
 }
 
@@ -150,7 +157,6 @@ static int
 server_accept(lua_State *T)
 {
 	struct ev_io *w;
-	int ret;
 
 	luaL_checktype(T, 1, LUA_TUSERDATA);
 	w = lua_touserdata(T, 1);
@@ -159,59 +165,73 @@ server_accept(lua_State *T)
 	if (w->data != NULL)
 		return io_busy(T);
 
-	ret = server__accept(T, w);
-	if (ret > 0)
-		return ret;
+	switch (server__accept(T, w, lua_upvalueindex(1))) {
+	case 1:
+		return 1;
+	case 2:
+		close(w->fd);
+		w->fd= -1;
+		return 2;
+	}
 
-	lua_settop(T, 1);
 	w->cb = server_accept_cb;
 	w->data = T;
 	ev_io_start(LEM_ w);
-	return lua_yield(T, 1);
+	lua_settop(T, 1);
+	lua_pushvalue(T, lua_upvalueindex(1));
+	return lua_yield(T, 2);
 }
 
 static void
 server_autospawn_cb(EV_P_ struct ev_io *w, int revents)
 {
 	lua_State *T = w->data;
-	struct sockaddr client_addr;
-	unsigned int client_addrlen;
 	int sock;
 	lua_State *S;
 
 	(void)revents;
 
 	/* dequeue the incoming connection */
-	client_addrlen = sizeof(struct sockaddr);
-	sock = accept(w->fd, &client_addr, &client_addrlen);
+#ifdef SOCK_CLOEXEC
+	sock = accept4(w->fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+#else
+	sock = accept(w->fd, NULL, NULL);
+#endif
 	if (sock < 0) {
-		if (errno == EAGAIN || errno == ECONNABORTED)
+		switch (errno) {
+		case EAGAIN: case EINTR: case ECONNABORTED:
+		case ENETDOWN: case EPROTO: case ENOPROTOOPT:
+		case EHOSTDOWN:
+#ifdef ENONET
+		case ENONET:
+#endif
+		case EHOSTUNREACH: case EOPNOTSUPP: case ENETUNREACH:
 			return;
+		}
 		lua_pushnil(T);
 		lua_pushfstring(T, "error accepting connection: %s",
 		                strerror(errno));
 		goto error;
 	}
-
-	/* make the socket non-blocking */
-	if (fcntl(sock, F_SETFL, O_NONBLOCK) < 0) {
+#ifndef SOCK_CLOEXEC
+	/* set FD_CLOEXEC and make the socket non-blocking */
+	if (fcntl(sock, F_SETFD, FD_CLOEXEC) == -1 ||
+			fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
 		close(sock);
 		lua_pushnil(T);
-		lua_pushfstring(T, "error making socket non-blocking: %s",
+		lua_pushfstring(T, "error setting socket flags: %s",
 		                strerror(errno));
 		goto error;
 	}
-
+#endif
 	S = lem_newthread();
 
-	/* copy handler function to thread */
+	/* copy handler function */
 	lua_pushvalue(T, 2);
-	lua_xmove(T, S, 1);
-
 	/* create stream */
-	stream_new(T, sock, lua_upvalueindex(1));
-	/* move stream to new thread */
-	lua_xmove(T, S, 1);
+	stream_new(T, sock, 3);
+	/* move function and stream to new thread */
+	lua_xmove(T, S, 2);
 
 	lem_queue(S, 1);
 	return;
