@@ -23,34 +23,18 @@ package.cpath = '?.so'
 local utils = require 'lem.utils'
 local io    = require 'lem.io'
 
-local format, write = string.format, io.write
+local write, format = io.write, string.format
+
+local p = assert(io.popen('telnet localhost 8080', 'rw'))
+
+assert(p:write('GET / HTTP/1.0'))
+assert(p:write('\n'))
+assert(p:write('\n'))
 
 local n = 0
-
-if not arg[1] then
-   io.stderr:write("I need a file..\n")
-   utils.exit(1)
-end
-
----[[
-local file, err = io.streamfile(arg[1])
---local file, err = io.open(arg[1])
-
-if not file then
-	io.stderr:write(format("Error opening '%s': %s\n", arg[1], err))
-	utils.exit(1)
-end
-
-for line in file:lines() do
-   n = n+1
-end
---[=[
---]]
-for line in io.lines(arg[1]) do
+for line in p:lines() do
 	n = n+1
+	write(format('%4d: %s\n', n, line))
 end
---]=]
-
-write(format('%d lines\n', n))
 
 -- vim: syntax=lua ts=2 sw=2 noet:

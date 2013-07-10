@@ -211,9 +211,10 @@ stream__write(lua_State *T, struct stream *s)
 	int err;
 
 	while ((bytes = write(s->w.fd, s->out, s->out_len)) > 0) {
+		lem_debug("wrote %ld bytes to fd %d", bytes, s->w.fd);
 		s->out += bytes;
 		s->out_len -= bytes;
-		if (s->out_len == 0) {
+		while (s->out_len == 0) {
 			if (s->idx == lua_gettop(T)) {
 				lua_pushboolean(T, 1);
 				return 1;
@@ -222,6 +223,7 @@ stream__write(lua_State *T, struct stream *s)
 		}
 	}
 	err = errno;
+	lem_debug("wrote %ld bytes to fd %d", bytes, s->w.fd);
 
 	if (bytes < 0 && (err == EAGAIN || err == EINTR))
 		return 0;
@@ -263,14 +265,18 @@ stream_write(lua_State *T)
 	struct stream *s;
 	const char *out;
 	size_t out_len;
+	int idx;
 	int i;
 	int top;
 	int ret;
 
 	luaL_checktype(T, 1, LUA_TUSERDATA);
-	out = luaL_checklstring(T, 2, &out_len);
 	top = lua_gettop(T);
-	for (i = 3; i <= top; i++)
+	idx = 1;
+	do {
+		out = luaL_checklstring(T, ++idx, &out_len);
+	} while (out_len == 0 && idx < top);
+	for (i = idx+1; i <= top; i++)
 		(void)luaL_checkstring(T, i);
 
 	s = lua_touserdata(T, 1);
@@ -278,10 +284,14 @@ stream_write(lua_State *T)
 		return io_closed(T);
 	if (s->w.data != NULL)
 		return io_busy(T);
+	if (out_len == 0) {
+		lua_pushboolean(T, 1);
+		return 1;
+	}
 
 	s->out = out;
 	s->out_len = out_len;
-	s->idx = 2;
+	s->idx = idx;
 	ret = stream__write(T, s);
 	if (ret > 0)
 		return ret;
@@ -529,64 +539,4 @@ stream_sendfile(lua_State *T)
 
 	lua_settop(T, 2);
 	return lua_yield(T, 2);
-}
-
-static int
-stream_popen(lua_State *T)
-{
-	const char *cmd = luaL_checkstring(T, 1);
-	const char *mode = luaL_optstring(T, 2, "r");
-	int fd[2];
-	int err;
-
-	if (mode[0] != 'r' && mode[0] != 'w')
-		return luaL_error(T, "invalid mode string");
-
-	if (pipe(fd))
-		return io_strerror(T, errno);
-
-	switch (fork()) {
-	case -1: /* error */
-		err = errno;
-		close(fd[0]);
-		close(fd[1]);
-		return io_strerror(T, err);
-
-	case 0: /* child */
-		if (mode[0] == 'r') {
-			close(fd[0]);
-			dup2(fd[1], 1);
-		} else {
-			close(fd[1]);
-			dup2(fd[0], 0);
-		}
-
-		execl("/bin/sh", "/bin/sh", "-c", cmd, NULL);
-		exit(EXIT_FAILURE);
-	}
-
-	if (mode[0] == 'r') {
-		if (close(fd[1])) {
-			err = errno;
-			close(fd[0]);
-			return io_strerror(T, err);
-		}
-	} else {
-		if (close(fd[0])) {
-			err = errno;
-			close(fd[1]);
-			return io_strerror(T, err);
-		}
-		fd[0] = fd[1];
-	}
-
-	/* make the pipe non-blocking */
-	if (fcntl(fd[0], F_SETFL, O_NONBLOCK) == -1) {
-		err = errno;
-		close(fd[0]);
-		return io_strerror(T, err);
-	}
-
-	stream_new(T, fd[0], lua_upvalueindex(1));
-	return 1;
 }

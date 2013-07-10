@@ -20,37 +20,31 @@
 package.path = '?.lua'
 package.cpath = '?.so'
 
-local utils = require 'lem.utils'
-local io    = require 'lem.io'
+local utils  = require 'lem.utils'
+local io     = require 'lem.io'
+local client = require 'lem.http.client'
 
-local format, write = string.format, io.write
-
-local n = 0
-
-if not arg[1] then
-   io.stderr:write("I need a file..\n")
-   utils.exit(1)
+local write, format = io.write, string.format
+local function printf(...)
+	return write(format(...))
 end
 
----[[
-local file, err = io.streamfile(arg[1])
---local file, err = io.open(arg[1])
+local url      = arg[1] or 'http://ompldr.org/vODFnOA/Birgit%20Lystager%20-%20Birger.mp3'
+local filename = arg[2] or 'birger.mp3'
+local stop     = false
 
-if not file then
-	io.stderr:write(format("Error opening '%s': %s\n", arg[1], err))
-	utils.exit(1)
-end
+utils.spawn(function()
+	local c = client.new()
 
-for line in file:lines() do
-   n = n+1
-end
---[=[
---]]
-for line in io.lines(arg[1]) do
-	n = n+1
-end
---]=]
+	assert(c:download(url, filename))
+	assert(c:close())
+	stop = true
+end)
 
-write(format('%d lines\n', n))
+local sleeper = utils.newsleeper()
+repeat
+	write('.')
+	sleeper:sleep(0.001)
+until stop
 
--- vim: syntax=lua ts=2 sw=2 noet:
+-- vim: set ts=2 sw=2 noet:

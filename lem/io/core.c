@@ -30,11 +30,13 @@
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <netdb.h>
+#include <spawn.h>
 
 #if defined(__FreeBSD__) || defined(__APPLE__)
 #include <sys/un.h>
 #include <sys/ucred.h>
 #include <netinet/in.h>
+extern char **environ;
 #ifndef UNIX_PATH_MAX
 #define UNIX_PATH_MAX 104
 #endif
@@ -107,6 +109,9 @@ error:
 #include "tcp.c"
 #include "unix.c"
 
+/*
+ * io.open()
+ */
 struct open {
 	struct lem_async a;
 	const char *path;
@@ -249,6 +254,196 @@ io_open(lua_State *T)
 	return lua_yield(T, 3);
 }
 
+/*
+ * io.popen()
+ */
+static const char *const io_popen_modes[] = { "r", "w", "rw", NULL };
+
+static int
+io_popen(lua_State *T)
+{
+	const char *cmd = luaL_checkstring(T, 1);
+	int mode = luaL_checkoption(T, 2, "r", io_popen_modes);
+	char *const argv[4] = { "/bin/sh", "-c", (char *)cmd, NULL };
+	posix_spawn_file_actions_t fa;
+	int fd[2];
+	pid_t pid;
+	int err;
+
+	switch (mode) {
+	case 0: /* "r" */
+		if (pipe(fd))
+			return io_strerror(T, errno);
+		posix_spawn_file_actions_init(&fa);
+		posix_spawn_file_actions_adddup2(&fa, fd[1], 1);
+		posix_spawn_file_actions_addclose(&fa, fd[1]);
+		break;
+	case 1: /* "w" */
+		if (pipe(fd))
+			return io_strerror(T, errno);
+		err = fd[0];
+		fd[0] = fd[1];
+		fd[1] = err;
+		posix_spawn_file_actions_init(&fa);
+		posix_spawn_file_actions_adddup2(&fa, fd[1], 0);
+		posix_spawn_file_actions_addclose(&fa, fd[1]);
+		break;
+	case 2: /* "rw" */
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd))
+			return io_strerror(T, errno);
+		posix_spawn_file_actions_init(&fa);
+		posix_spawn_file_actions_adddup2(&fa, fd[1], 0);
+		posix_spawn_file_actions_adddup2(&fa, fd[1], 1);
+		posix_spawn_file_actions_addclose(&fa, fd[1]);
+		break;
+	}
+
+	/* set our socket flags */
+	if (fcntl(fd[0], F_SETFD, FD_CLOEXEC) == -1 ||
+			fcntl(fd[0], F_SETFL, O_NONBLOCK) == -1) {
+		err = errno;
+		goto error;
+	}
+
+	err = posix_spawn(&pid, argv[0], &fa, NULL, argv, environ);
+	lem_debug("err = %d, %s", err, strerror(err));
+	if (err)
+		goto error;
+
+	posix_spawn_file_actions_destroy(&fa);
+	close(fd[1]);
+	stream_new(T, fd[0], lua_upvalueindex(1));
+	lua_pushnumber(T, pid);
+	return 2;
+error:
+	posix_spawn_file_actions_destroy(&fa);
+	close(fd[0]);
+	close(fd[1]);
+	return io_strerror(T, err);
+}
+
+/*
+ * io.streamfile()
+ */
+struct streamfile {
+	struct lem_async a;
+	const char *filename;
+	int pipe[2];
+	int file;
+};
+
+static void
+io_streamfile_work(struct lem_async *a)
+{
+	struct streamfile *s = (struct streamfile *)a;
+	int file = s->file;
+	int pipe = s->pipe[1];
+
+#ifdef __FreeBSD__
+	sendfile(file, pipe, 0, 0, NULL, NULL, SF_SYNC);
+#else
+#ifdef __APPLE__
+	off_t len = 0;
+	sendfile(file, pipe, 0, &len, NULL, 0);
+#else
+	while (sendfile(pipe, file, NULL, 2147483647) > 0);
+#endif
+#endif
+	close(file);
+	close(pipe);
+}
+
+static void
+io_streamfile_open(struct lem_async *a)
+{
+	struct streamfile *s = (struct streamfile *)a;
+	int file = open(s->filename,
+#ifdef O_CLOEXEC
+			O_CLOEXEC |
+#endif
+			O_RDONLY);
+	if (file < 0) {
+		s->file = -errno;
+		return;
+	}
+#ifndef O_CLOEXEC
+	if (fcntl(file, F_SETFD, FD_CLOEXEC) == -1) {
+		s->file = -errno;
+		goto err1;
+	}
+#endif
+
+	if (socketpair(AF_UNIX,
+#ifdef SOCK_CLOEXEC
+				SOCK_CLOEXEC |
+#endif
+				SOCK_STREAM, 0, s->pipe)) {
+		s->file = -errno;
+		goto err1;
+	}
+	if (
+#ifndef SOCK_CLOEXEC
+			fcntl(s->pipe[1], F_SETFD, FD_CLOEXEC) == -1 ||
+			fcntl(s->pipe[0], F_SETFD, FD_CLOEXEC) == -1 ||
+#endif
+			shutdown(s->pipe[0], SHUT_WR)) {
+		s->file = -errno;
+		goto err2;
+	}
+	if (fcntl(s->pipe[0], F_SETFL, O_NONBLOCK) == -1) {
+		s->file = -errno;
+		goto err2;
+	}
+	s->file = file;
+	return;
+err2:
+	close(s->pipe[0]);
+	close(s->pipe[1]);
+err1:
+	close(file);
+}
+
+static void
+io_streamfile_reap(struct lem_async *a)
+{
+	struct streamfile *s = (struct streamfile *)a;
+	lua_State *T = s->a.T;
+	int ret;
+
+	if (T == NULL) {
+		free(s);
+		return;
+	}
+
+	ret = s->file;
+	if (ret < 0) {
+		free(s);
+		lem_queue(T, io_strerror(T, -ret));
+		return;
+	}
+	lem_debug("s->file = %d, s->pipe[0] = %d, s->pipe[1] = %d",
+			ret, s->pipe[0], s->pipe[1]);
+
+	lem_async_do(&s->a, NULL, io_streamfile_work, io_streamfile_reap);
+
+	stream_new(T, s->pipe[0], 2);
+	lem_queue(T, 1);
+}
+
+static int
+io_streamfile(lua_State *T)
+{
+	const char *filename = lua_tostring(T, 1);
+	struct streamfile *s = lem_xmalloc(sizeof(struct streamfile));
+
+	s->filename = filename;
+	lem_async_do(&s->a, T, io_streamfile_open, io_streamfile_reap);
+
+	lua_settop(T, 1);
+	lua_pushvalue(T, lua_upvalueindex(1));
+	return lua_yield(T, 2);
+}
+
 static void
 push_stdstream(lua_State *L, int fd)
 {
@@ -384,8 +579,12 @@ luaopen_lem_io_core(lua_State *L)
 	lua_setfield(L, -2, "open");
 	/* insert popen function */
 	lua_getfield(L, -1, "Stream"); /* upvalue 1 = Stream */
-	lua_pushcclosure(L, stream_popen, 1);
+	lua_pushcclosure(L, io_popen, 1);
 	lua_setfield(L, -2, "popen");
+	/* insert streamfile function */
+	lua_getfield(L, -1, "Stream"); /* upvalue 1 = Stream */
+	lua_pushcclosure(L, io_streamfile, 1);
+	lua_setfield(L, -2, "streamfile");
 
 	/* create tcp table */
 	lua_createtable(L, 0, 0);

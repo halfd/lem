@@ -20,41 +20,33 @@
 package.path = '?.lua'
 package.cpath = '?.so'
 
-local utils = require 'lem.utils'
-local io    = require 'lem.io'
-local http  = require 'lem.http'
+local utils  = require 'lem.utils'
+local io     = require 'lem.io'
+local client = require 'lem.http.client'
 
 local write, format = io.write, string.format
 local function printf(...)
 	return write(format(...))
 end
 
-local domain, port = arg[1] or 'www.google.com', 'http'
+local url = arg[1] or 'http://www.google.com/'
 local running = 0
 
 local function get(n, close)
 	running = running + 1
 
-	local req
-	if close then
-		req = 'GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n'
-	else
-		req = 'GET / HTTP/1.1\r\nHost: %s\r\n\r\n'
-	end
+	local c = client.new()
 
-	local conn = assert(io.tcp.connect(domain, port))
-	assert(conn:write(req:format(domain)))
-	local res = assert(conn:read('HTTPResponse'))
+	local res = assert(c:get(url))
 
 	printf('\n%d: HTTP/%s %d %s\n', n, res.version, res.status, res.text)
 	for k, v in pairs(res.headers) do
 		printf('%d: %s: %s\n', n, k, v)
 	end
 
-	local body = assert(res:body())
-	printf('\n%d: #body = %d\n', n, #body)
+	printf('\n%d: #body = %d\n', n, #res.body)
 
-	conn:close()
+	assert(c:close())
 	running = running - 1
 end
 

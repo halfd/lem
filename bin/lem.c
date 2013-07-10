@@ -56,10 +56,10 @@ struct lem_runqueue_slot {
 
 struct lem_runqueue {
 	struct ev_idle w;
-	unsigned long first;
-	unsigned long last;
-	unsigned long mask;
 	struct lem_runqueue_slot *queue;
+	unsigned int first;
+	unsigned int last;
+	unsigned int mask;
 };
 
 #if EV_MULTIPLICITY
@@ -94,21 +94,17 @@ lem_xmalloc(size_t size)
 }
 
 static int
-ignore_sigpipe(void)
+setsignal(int signal, void (*handler)(int), int flags)
 {
 	struct sigaction act;
 
-	if (sigaction(SIGPIPE, NULL, &act)) {
-		lem_log_error("lem: error getting signal action: %s",
-		              strerror(errno));
-		return -1;
-	}
+	act.sa_handler = handler;
+	sigemptyset(&act.sa_mask);
+	act.sa_flags = flags;
 
-	act.sa_handler = SIG_IGN;
-
-	if (sigaction(SIGPIPE, &act, NULL)) {
-		lem_log_error("lem: error setting signal action: %s",
-		              strerror(errno));
+	if (sigaction(signal, &act, NULL)) {
+		lem_log_error("lem: error setting signal %d: %s",
+		              signal, strerror(errno));
 		return -1;
 	}
 
@@ -166,11 +162,11 @@ lem_queue(lua_State *T, int nargs)
 	rq.last++;
 	rq.last &= rq.mask;
 	if (rq.first == rq.last) {
-		unsigned long i;
-		unsigned long j;
+		unsigned int i;
+		unsigned int j;
 		struct lem_runqueue_slot *new_queue;
 
-		lem_debug("expanding queue to %lu slots", 2*(rq.mask + 1));
+		lem_debug("expanding queue to %u slots", 2*(rq.mask + 1));
 		new_queue = lem_xmalloc(2*(rq.mask + 1)
 				* sizeof(struct lem_runqueue_slot));
 
@@ -340,7 +336,11 @@ main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	if (ignore_sigpipe())
+	if (setsignal(SIGPIPE, SIG_IGN, 0)
+#if !EV_CHILD_ENABLE
+	    || setsignal(SIGCHLD, SIG_DFL, SA_NOCLDSTOP | SA_NOCLDWAIT)
+#endif
+	   )
 		goto error;
 
 	/* create main Lua state */
@@ -386,8 +386,12 @@ main(int argc, char *argv[])
 	/* free runqueue */
 	free(rq.queue);
 
-	/* close default loop */
+	/* destroy loop */
+#if EV_MULTIPLICITY
+	ev_loop_destroy(lem_loop);
+#else
 	ev_default_destroy();
+#endif
 	lem_debug("Bye %s", exit_status == EXIT_SUCCESS ? "o/" : ":(");
 	return exit_status;
 
@@ -396,6 +400,10 @@ error:
 		lua_close(L);
 	if (rq.queue)
 		free(rq.queue);
+#if EV_MULTIPLICITY
+	ev_loop_destroy(lem_loop);
+#else
 	ev_default_destroy();
+#endif
 	return EXIT_FAILURE;
 }
