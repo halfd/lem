@@ -114,6 +114,7 @@ error:
  */
 struct open {
 	struct lem_async a;
+	lua_State *T;
 	const char *path;
 	int fd;
 	int flags;
@@ -130,7 +131,7 @@ io_open_work(struct lem_async *a)
 #ifdef O_CLOEXEC
 			| O_CLOEXEC
 #endif
-			| O_NONBLOCK, o->fd >= 0 ? o->fd :
+			, o->fd >= 0 ? o->fd :
 			S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
 	if (fd < 0) {
 		o->flags = -errno;
@@ -157,6 +158,10 @@ io_open_work(struct lem_async *a)
 	case S_IFCHR:
 	case S_IFIFO:
 		o->flags = 1;
+		if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
+			o->flags = -errno;
+			close(fd);
+		}
 		break;
 
 	default:
@@ -169,7 +174,7 @@ static void
 io_open_reap(struct lem_async *a)
 {
 	struct open *o = (struct open *)a;
-	lua_State *T = o->a.T;
+	lua_State *T = o->T;
 	int fd = o->fd;
 	int ret = o->flags;
 
@@ -243,14 +248,120 @@ io_open(lua_State *T)
 		return luaL_error(T, "invalid mode string");
 
 	o = lem_xmalloc(sizeof(struct open));
+	o->T = T;
 	o->path = path;
 	o->fd = perm;
 	o->flags = flags;
-	lem_async_do(&o->a, T, io_open_work, io_open_reap);
+	lem_async_do(&o->a, io_open_work, io_open_reap);
 
 	lua_settop(T, 1);
 	lua_pushvalue(T, lua_upvalueindex(1));
 	lua_pushvalue(T, lua_upvalueindex(2));
+	return lua_yield(T, 3);
+}
+
+/*
+ * io.fromfd()
+ */
+struct fromfd {
+	struct lem_async a;
+	lua_State *T;
+	int fd;
+	int ret;
+};
+
+static int
+io_socket_listening(int fd)
+{
+	int val;
+	socklen_t len = sizeof(int);
+
+	if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &val, &len) == 0 && val)
+		return 1;
+
+	return 0;
+}
+
+static void
+io_fromfd_work(struct lem_async *a)
+{
+	struct fromfd *ff = (struct fromfd *)a;
+	struct stat st;
+
+	if (fstat(ff->fd, &st)) {
+		ff->ret = -errno;
+		return;
+	}
+
+	lem_debug("st.st_mode & S_IFMT = %o", st.st_mode & S_IFMT);
+	switch (st.st_mode & S_IFMT) {
+	case S_IFREG:
+	case S_IFBLK:
+		ff->ret = 0;
+		break;
+
+	case S_IFSOCK:
+		if (io_socket_listening(ff->fd)) {
+			ff->ret = 2;
+			goto nonblock;
+		}
+		/* fallthrough */
+	case S_IFCHR:
+	case S_IFIFO:
+		ff->ret = 1;
+		goto nonblock;
+
+	default:
+		ff->ret = -EINVAL;
+		break;
+	}
+	return;
+nonblock:
+	if (fcntl(ff->fd, F_SETFL, O_NONBLOCK) == -1)
+		ff->ret = -errno;
+}
+
+static void
+io_fromfd_reap(struct lem_async *a)
+{
+	struct fromfd *ff = (struct fromfd *)a;
+	lua_State *T = ff->T;
+	int fd = ff->fd;
+	int ret = ff->ret;
+
+	lem_debug("ret = %d", ret);
+	free(ff);
+
+	switch (ret) {
+	case 0: file_new(T, fd, 1); break;
+	case 1: stream_new(T, fd, 2); break;
+	case 2: server_new(T, fd, 3); break;
+	default:
+		lem_queue(T, io_strerror(T, -ret));
+		return;
+	}
+
+	lem_queue(T, 1);
+}
+
+static int
+io_fromfd(lua_State *T)
+{
+	int fd = luaL_checkint(T, 1);
+	struct fromfd *ff;
+
+	if (fd < 0)
+		return luaL_argerror(T, 1, "invalid fd");
+
+	ff = lem_xmalloc(sizeof(struct fromfd));
+	ff->T = T;
+	ff->fd = fd;
+	lem_async_do(&ff->a, io_fromfd_work, io_fromfd_reap);
+
+	lua_settop(T, 0);
+	lua_pushvalue(T, lua_upvalueindex(1));
+	lua_pushvalue(T, lua_upvalueindex(2));
+	lua_pushvalue(T, lua_upvalueindex(3));
 	return lua_yield(T, 3);
 }
 
@@ -327,13 +438,14 @@ error:
  */
 struct streamfile {
 	struct lem_async a;
+	lua_State *T;
 	const char *filename;
 	int pipe[2];
 	int file;
 };
 
 static void
-io_streamfile_work(struct lem_async *a)
+io_streamfile_worker(struct lem_async *a)
 {
 	struct streamfile *s = (struct streamfile *)a;
 	int file = s->file;
@@ -407,15 +519,9 @@ static void
 io_streamfile_reap(struct lem_async *a)
 {
 	struct streamfile *s = (struct streamfile *)a;
-	lua_State *T = s->a.T;
-	int ret;
+	lua_State *T = s->T;
+	int ret = s->file;
 
-	if (T == NULL) {
-		free(s);
-		return;
-	}
-
-	ret = s->file;
 	if (ret < 0) {
 		free(s);
 		lem_queue(T, io_strerror(T, -ret));
@@ -424,7 +530,7 @@ io_streamfile_reap(struct lem_async *a)
 	lem_debug("s->file = %d, s->pipe[0] = %d, s->pipe[1] = %d",
 			ret, s->pipe[0], s->pipe[1]);
 
-	lem_async_do(&s->a, NULL, io_streamfile_work, io_streamfile_reap);
+	lem_async_do(&s->a, io_streamfile_worker, NULL);
 
 	stream_new(T, s->pipe[0], 2);
 	lem_queue(T, 1);
@@ -436,8 +542,9 @@ io_streamfile(lua_State *T)
 	const char *filename = lua_tostring(T, 1);
 	struct streamfile *s = lem_xmalloc(sizeof(struct streamfile));
 
+	s->T = T;
 	s->filename = filename;
-	lem_async_do(&s->a, T, io_streamfile_open, io_streamfile_reap);
+	lem_async_do(&s->a, io_streamfile_open, io_streamfile_reap);
 
 	lua_settop(T, 1);
 	lua_pushvalue(T, lua_upvalueindex(1));
@@ -573,10 +680,16 @@ luaopen_lem_io_core(lua_State *L)
 	lua_setfield(L, -2, "Server");
 
 	/* insert open function */
-	lua_getfield(L, -1, "File");   /* upvalue 1 = File */
+	lua_getfield(L, -1, "File");   /* upvalue 1 = File   */
 	lua_getfield(L, -2, "Stream"); /* upvalue 2 = Stream */
 	lua_pushcclosure(L, io_open, 2);
 	lua_setfield(L, -2, "open");
+	/* insert the fromfd function */
+	lua_getfield(L, -1, "File");   /* upvalue 1 = File   */
+	lua_getfield(L, -2, "Stream"); /* upvalue 2 = Stream */
+	lua_getfield(L, -3, "Server"); /* upvalue 3 = Server */
+	lua_pushcclosure(L, io_fromfd, 3);
+	lua_setfield(L, -2, "fromfd");
 	/* insert popen function */
 	lua_getfield(L, -1, "Stream"); /* upvalue 1 = Stream */
 	lua_pushcclosure(L, io_popen, 1);

@@ -18,6 +18,7 @@
 
 struct file {
 	struct lem_async a;
+	lua_State *T;
 	int fd;
 	int ret;
 	union {
@@ -45,6 +46,11 @@ struct file {
 	struct lem_inputbuf buf;
 };
 
+struct file_gc {
+	struct lem_async a;
+	int fd;
+};
+
 static struct file *
 file_new(lua_State *T, int fd, int mt)
 {
@@ -56,11 +62,22 @@ file_new(lua_State *T, int fd, int mt)
 	lua_setmetatable(T, -2);
 
 	/* initialize userdata */
-	f->a.T = NULL;
+	f->T = NULL;
 	f->fd = fd;
 	lem_inputbuf_init(&f->buf);
 
 	return f;
+}
+
+/*
+ * file:__gc() metamethod
+ */
+static void
+file_gc_work(struct lem_async *a)
+{
+	struct file_gc *gc = (struct file_gc *)a;
+
+	close(gc->fd);
 }
 
 static int
@@ -69,8 +86,13 @@ file_gc(lua_State *T)
 	struct file *f = lua_touserdata(T, 1);
 
 	lem_debug("collecting %p, fd = %d", f, f->fd);
-	if (f->fd >= 0)
-		(void)close(f->fd);
+	if (f->fd >= 0) {
+		struct file_gc *gc = lem_xmalloc(sizeof(struct file_gc));
+
+		gc->fd = f->fd;
+		f->fd = -1;
+		lem_async_do(&gc->a, file_gc_work, NULL);
+	}
 
 	return 0;
 }
@@ -86,27 +108,53 @@ file_closed(lua_State *T)
 	return 1;
 }
 
+/*
+ * file:close() method
+ */
+static void
+file_close_work(struct lem_async *a)
+{
+	struct file *f = (struct file *)a;
+
+	if (close(f->fd))
+		f->ret = errno;
+	else
+		f->ret = 0;
+}
+
+static void
+file_close_reap(struct lem_async *a)
+{
+	struct file *f = (struct file *)a;
+	lua_State *T = f->T;
+
+	f->T = NULL;
+	f->fd = -1;
+	if (f->ret) {
+		lem_queue(T, io_strerror(T, f->ret));
+		return;
+	}
+
+	lua_pushboolean(T, 1);
+	lem_queue(T, 1);
+}
+
 static int
 file_close(lua_State *T)
 {
 	struct file *f;
-	int ret;
 
 	luaL_checktype(T, 1, LUA_TUSERDATA);
 	f = lua_touserdata(T, 1);
 	if (f->fd < 0)
 		return io_closed(T);
-	if (f->a.T != NULL)
+	if (f->T != NULL)
 		return io_busy(T);
 
-	lem_debug("collecting %d", f->fd);
-	ret = close(f->fd);
-	f->fd = -1;
-	if (ret)
-		return io_strerror(T, errno);
-
-	lua_pushboolean(T, 1);
-	return 1;
+	f->T = T;
+	lem_async_do(&f->a, file_close_work, file_close_reap);
+	lua_settop(T, 1);
+	return lua_yield(T, 1);
 }
 
 /*
@@ -136,13 +184,13 @@ static void
 file_readp_reap(struct lem_async *a)
 {
 	struct file *f = (struct file *)a;
-	lua_State *T = f->a.T;
+	lua_State *T = f->T;
 	int ret;
 
 	if (f->ret) {
 		enum lem_preason res = f->ret < 0 ? LEM_PCLOSED : LEM_PERROR;
 
-		f->a.T = NULL;
+		f->T = NULL;
 
 		if (f->readp.p->destroy &&
 				(ret = f->readp.p->destroy(T, &f->buf, res)) > 0) {
@@ -161,12 +209,12 @@ file_readp_reap(struct lem_async *a)
 
 	ret = f->readp.p->process(T, &f->buf);
 	if (ret > 0) {
-		f->a.T = NULL;
+		f->T = NULL;
 		lem_queue(T, ret);
 		return;
 	}
 
-	lem_async_put(&f->a);
+	lem_async_run(&f->a);
 }
 
 static int
@@ -184,7 +232,7 @@ file_readp(lua_State *T)
 	f = lua_touserdata(T, 1);
 	if (f->fd < 0)
 		return io_closed(T);
-	if (f->a.T != NULL)
+	if (f->T != NULL)
 		return io_busy(T);
 
 	p = lua_touserdata(T, 2);
@@ -195,8 +243,9 @@ file_readp(lua_State *T)
 	if (ret > 0)
 		return ret;
 
+	f->T = T;
 	f->readp.p = p;
-	lem_async_do(&f->a, T, file_readp_work, file_readp_reap);
+	lem_async_do(&f->a, file_readp_work, file_readp_reap);
 	return lua_yield(T, lua_gettop(T));
 }
 
@@ -219,11 +268,11 @@ static void
 file_write_reap(struct lem_async *a)
 {
 	struct file *f = (struct file *)a;
-	lua_State *T = f->a.T;
+	lua_State *T = f->T;
 	int top;
 
 	if (f->ret) {
-		f->a.T = NULL;
+		f->T = NULL;
 		lem_queue(T, io_strerror(T, f->ret));
 		return;
 	}
@@ -231,7 +280,7 @@ file_write_reap(struct lem_async *a)
 	top = lua_gettop(T);
 	do {
 		if (f->write.idx == top) {
-			f->a.T = NULL;
+			f->T = NULL;
 			lua_pushboolean(T, 1);
 			lem_queue(T, 1);
 			return;
@@ -240,7 +289,7 @@ file_write_reap(struct lem_async *a)
 		f->write.str = lua_tolstring(T, ++f->write.idx, &f->write.len);
 	} while (f->write.len == 0);
 
-	lem_async_put(&f->a);
+	lem_async_run(&f->a);
 }
 
 static int
@@ -265,17 +314,18 @@ file_write(lua_State *T)
 	f = lua_touserdata(T, 1);
 	if (f->fd < 0)
 		return io_closed(T);
-	if (f->a.T != NULL)
+	if (f->T != NULL)
 		return io_busy(T);
 	if (len == 0) {
 		lua_pushboolean(T, 1);
 		return 1;
 	}
 
+	f->T = T;
 	f->write.str = str;
 	f->write.len = len;
 	f->write.idx = idx;
-	lem_async_do(&f->a, T, file_write_work, file_write_reap);
+	lem_async_do(&f->a, file_write_work, file_write_reap);
 
 	return lua_yield(T, top);
 }
@@ -301,9 +351,9 @@ static void
 file_size_reap(struct lem_async *a)
 {
 	struct file *f = (struct file *)a;
-	lua_State *T = f->a.T;
+	lua_State *T = f->T;
 
-	f->a.T = NULL;
+	f->T = NULL;
 
 	if (f->ret) {
 		lem_queue(T, io_strerror(T, f->ret));
@@ -323,10 +373,11 @@ file_size(lua_State *T)
 	f = lua_touserdata(T, 1);
 	if (f->fd < 0)
 		return io_closed(T);
-	if (f->a.T != NULL)
+	if (f->T != NULL)
 		return io_busy(T);
 
-	lem_async_do(&f->a, T, file_size_work, file_size_reap);
+	f->T = T;
+	lem_async_do(&f->a, file_size_work, file_size_reap);
 
 	lua_settop(T, 1);
 	return lua_yield(T, 1);
@@ -353,9 +404,9 @@ static void
 file_seek_reap(struct lem_async *a)
 {
 	struct file *f = (struct file *)a;
-	lua_State *T = f->a.T;
+	lua_State *T = f->T;
 
-	f->a.T = NULL;
+	f->T = NULL;
 
 	if (f->ret) {
 		lem_queue(T, io_strerror(T, f->ret));
@@ -384,14 +435,15 @@ file_seek(lua_State *T)
 			"not an integer in proper range");
 	if (f->fd < 0)
 		return io_closed(T);
-	if (f->a.T != NULL)
+	if (f->T != NULL)
 		return io_busy(T);
 
 	/* flush input buffer */
 	lem_inputbuf_init(&f->buf);
 
+	f->T = T;
 	f->seek.whence = mode[op];
-	lem_async_do(&f->a, T, file_seek_work, file_seek_reap);
+	lem_async_do(&f->a, file_seek_work, file_seek_reap);
 
 	lua_settop(T, 1);
 	return lua_yield(T, 1);
@@ -421,9 +473,9 @@ static void
 file_lock_reap(struct lem_async *a)
 {
 	struct file *f = (struct file *)a;
-	lua_State *T = f->a.T;
+	lua_State *T = f->T;
 
-	f->a.T = NULL;
+	f->T = NULL;
 
 	if (f->ret) {
 		lem_queue(T, io_strerror(T, f->ret));
@@ -457,11 +509,12 @@ file_lock(lua_State *T)
 			"not an integer in proper range");
 	if (f->fd < 0)
 		return io_closed(T);
-	if (f->a.T != NULL)
+	if (f->T != NULL)
 		return io_busy(T);
 
+	f->T = T;
 	f->lock.type = mode[op];
-	lem_async_do(&f->a, T, file_lock_work, file_lock_reap);
+	lem_async_do(&f->a, file_lock_work, file_lock_reap);
 
 	lua_settop(T, 1);
 	return lua_yield(T, 1);

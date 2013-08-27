@@ -22,6 +22,7 @@
 
 struct tcp_getaddr {
 	struct lem_async a;
+	lua_State *T;
 	const char *node;
 	const char *service;
 	int sock;
@@ -113,7 +114,7 @@ static void
 tcp_connect_reap(struct lem_async *a)
 {
 	struct tcp_getaddr *g = (struct tcp_getaddr *)a;
-	lua_State *T = g->a.T;
+	lua_State *T = g->T;
 	int sock = g->sock;
 
 	lem_debug("connection established");
@@ -153,10 +154,11 @@ tcp_connect(lua_State *T)
 	struct tcp_getaddr *g;
 
 	g = lem_xmalloc(sizeof(struct tcp_getaddr));
+	g->T = T;
 	g->node = node;
 	g->service = service;
 	g->sock = family;
-	lem_async_do(&g->a, T, tcp_connect_work, tcp_connect_reap);
+	lem_async_do(&g->a, tcp_connect_work, tcp_connect_reap);
 
 	lua_settop(T, 2);
 	lua_pushvalue(T, lua_upvalueindex(1));
@@ -250,26 +252,15 @@ static void
 tcp_listen_reap(struct lem_async *a)
 {
 	struct tcp_getaddr *g = (struct tcp_getaddr *)a;
-	lua_State *T = g->a.T;
+	lua_State *T = g->T;
 	int sock = g->sock;
 
 	if (g->node == NULL)
 		g->node = "*";
 
 	if (sock >= 0) {
-		struct ev_io *w;
-
 		free(g);
-
-		/* create userdata and set the metatable */
-		w = lua_newuserdata(T, sizeof(struct ev_io));
-		lua_pushvalue(T, 3);
-		lua_setmetatable(T, -2);
-
-		/* initialize userdata */
-		ev_io_init(w, NULL, sock, EV_READ);
-		w->data = NULL;
-
+		server_new(T, sock, 3);
 		lem_queue(T, 1);
 		return;
 	}
@@ -309,11 +300,12 @@ tcp_listen(lua_State *T, int family)
 		node = NULL;
 
 	g = lem_xmalloc(sizeof(struct tcp_getaddr));
+	g->T = T;
 	g->node = node;
 	g->service = service;
 	g->sock = family;
 	g->err = backlog;
-	lem_async_do(&g->a, T, tcp_listen_work, tcp_listen_reap);
+	lem_async_do(&g->a, tcp_listen_work, tcp_listen_reap);
 
 	lua_settop(T, 2);
 	lua_pushvalue(T, lua_upvalueindex(1));

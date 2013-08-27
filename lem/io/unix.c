@@ -18,6 +18,7 @@
 
 struct unix_create {
 	struct lem_async a;
+	lua_State *T;
 	const char *path;
 	size_t len;
 	int sock;
@@ -76,7 +77,7 @@ static void
 unix_connect_reap(struct lem_async *a)
 {
 	struct unix_create *u = (struct unix_create *)a;
-	lua_State *T = u->a.T;
+	lua_State *T = u->T;
 	int sock = u->sock;
 
 	if (sock >= 0) {
@@ -113,9 +114,10 @@ unix_connect(lua_State *T)
 		return luaL_argerror(T, 1, "path too long");
 
 	u = lem_xmalloc(sizeof(struct unix_create));
+	u->T = T;
 	u->path = path;
 	u->len = len;
-	lem_async_do(&u->a, T, unix_connect_work, unix_connect_reap);
+	lem_async_do(&u->a, unix_connect_work, unix_connect_reap);
 
 	lua_settop(T, 1);
 	lua_pushvalue(T, lua_upvalueindex(1));
@@ -134,8 +136,7 @@ unix_listen_work(struct lem_async *a)
 			SOCK_CLOEXEC |
 #endif
 			SOCK_STREAM, 0);
-	if (sock < 0
-			) {
+	if (sock < 0) {
 		u->sock = -1;
 		u->err = errno;
 		return;
@@ -187,23 +188,12 @@ static void
 unix_listen_reap(struct lem_async *a)
 {
 	struct unix_create *u = (struct unix_create *)a;
-	lua_State *T = u->a.T;
+	lua_State *T = u->T;
 	int sock = u->sock;
 
 	if (sock >= 0) {
-		struct ev_io *w;
-
 		free(u);
-
-		/* create userdata and set the metatable */
-		w = lua_newuserdata(T, sizeof(struct ev_io));
-		lua_pushvalue(T, 2);
-		lua_setmetatable(T, -2);
-
-		/* initialize userdata */
-		ev_io_init(w, NULL, sock, EV_READ);
-		w->data = NULL;
-
+		server_new(T, sock, 2);
 		lem_queue(T, 1);
 		return;
 	}
@@ -244,11 +234,12 @@ unix_listen(lua_State *T)
 		return luaL_argerror(T, 1, "path too long");
 
 	u = lem_xmalloc(sizeof(struct unix_create));
+	u->T = T;
 	u->path = path;
 	u->len = len;
 	u->sock = perm;
 	u->err = backlog;
-	lem_async_do(&u->a, T, unix_listen_work, unix_listen_reap);
+	lem_async_do(&u->a, unix_listen_work, unix_listen_reap);
 
 	lua_settop(T, 1);
 	lua_pushvalue(T, lua_upvalueindex(1));
